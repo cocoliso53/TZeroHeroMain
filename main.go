@@ -4,17 +4,17 @@ import (
 	"bufio"
 	"encoding/json"
 	"fmt"
+	"io"
 	"log"
 	"os"
 	"os/exec"
 	"strconv"
 	"strings"
+	"syscall"
 	"time"
 
 	"github.com/veandco/go-sdl2/img"
 	"github.com/veandco/go-sdl2/sdl"
-
-	// NEW: text rendering
 	"github.com/veandco/go-sdl2/ttf"
 )
 
@@ -75,6 +75,267 @@ func extractFrame(index int) error {
 	return cmd.Run()
 }
 
+func drawFinishLine(
+	renderer *sdl.Renderer,
+	outW int32,
+	outH int32,
+) error {
+	lineX := outW / 2
+
+	if err := renderer.SetDrawColor(255, 0, 0, 255); err != nil {
+		return err
+	}
+
+	for offset := int32(-1); offset <= 1; offset++ {
+		if err := renderer.DrawLine(
+			lineX+offset,
+			0,
+			lineX+offset,
+			outH,
+		); err != nil {
+			return err
+		}
+	}
+
+	return nil
+}
+
+func readJPEG(reader *bufio.Reader) ([]byte, error) {
+	var frame []byte
+
+	for {
+		b, err := reader.ReadByte()
+		if err != nil {
+			return nil, err
+		}
+
+		if b != 0xFF {
+			continue
+		}
+
+		next, err := reader.ReadByte()
+		if err != nil {
+			return nil, err
+		}
+
+		if next == 0xD8 {
+			frame = append(frame, 0xFF, 0xD8)
+			break
+		}
+	}
+
+	for {
+		b, err := reader.ReadByte()
+		if err != nil {
+			return nil, err
+		}
+
+		frame = append(frame, b)
+
+		if len(frame) >= 2 &&
+			frame[len(frame)-2] == 0xFF &&
+			frame[len(frame)-1] == 0xD9 {
+			return frame, nil
+		}
+	}
+}
+
+func textureFromJPEG(
+	renderer *sdl.Renderer,
+	data []byte,
+) (*sdl.Texture, error) {
+	rw, err := sdl.RWFromMem(data)
+	if err != nil {
+		return nil, err
+	}
+
+	return img.LoadTextureRW(renderer, rw, true)
+}
+
+func calibrate(
+	renderer *sdl.Renderer,
+	outW int32,
+	outH int32,
+) error {
+	fmt.Println("Calibration mode")
+	fmt.Println("Align the red line with the finish line.")
+	fmt.Print("[s]tart [q]uit > ")
+
+	cmd := exec.Command(
+		"rpicam-vid",
+		"-t", "0",
+		"--width", "1280",
+		"--height", "720",
+		"--framerate", "30",
+		"--codec", "mjpeg",
+		"-n",
+		"-o", "-",
+	)
+
+	stdout, err := cmd.StdoutPipe()
+	if err != nil {
+		return err
+	}
+
+	cmd.Stderr = os.Stderr
+
+	if err := cmd.Start(); err != nil {
+		return err
+	}
+
+	frames := make(chan []byte, 1)
+
+	go func() {
+		defer close(frames)
+
+		reader := bufio.NewReaderSize(stdout, 1024*1024)
+
+		for {
+			frame, err := readJPEG(reader)
+			if err != nil {
+				if err != io.EOF {
+					fmt.Printf("preview read error: %v\n", err)
+				}
+				return
+			}
+
+			select {
+			case frames <- frame:
+			default:
+				select {
+				case <-frames:
+				default:
+				}
+
+				select {
+				case frames <- frame:
+				default:
+				}
+			}
+		}
+	}()
+
+	// NEW: terminal input, same style as review mode
+	input := make(chan string)
+
+	go func() {
+		reader := bufio.NewReader(os.Stdin)
+
+		for {
+			text, err := reader.ReadString('\n')
+			if err != nil {
+				close(input)
+				return
+			}
+
+			input <- strings.TrimSpace(text)
+		}
+	}()
+
+	var texture *sdl.Texture
+
+	stopCamera := func() {
+		if cmd.Process != nil {
+			_ = cmd.Process.Signal(syscall.SIGTERM)
+		}
+
+		_ = cmd.Wait()
+	}
+
+	defer func() {
+		if texture != nil {
+			texture.Destroy()
+		}
+	}()
+
+	for {
+		// NEW: terminal commands
+		select {
+		case command, ok := <-input:
+			if !ok {
+				stopCamera()
+				return fmt.Errorf("stdin closed")
+			}
+
+			switch command {
+			case "s":
+				fmt.Println("Starting sprint sequence")
+
+				stopCamera()
+
+				if texture != nil {
+					texture.Destroy()
+					texture = nil
+				}
+
+				return nil
+
+			case "q":
+				stopCamera()
+				os.Exit(0)
+
+			default:
+				fmt.Print("[s]tart [q]uit > ")
+			}
+
+		default:
+		}
+
+		// Keep SDL responsive too.
+		for event := sdl.PollEvent(); event != nil; event = sdl.PollEvent() {
+			switch event.(type) {
+			case *sdl.QuitEvent:
+				stopCamera()
+				os.Exit(0)
+			}
+		}
+
+		select {
+		case frame, ok := <-frames:
+			if !ok {
+				return fmt.Errorf("camera preview stopped unexpectedly")
+			}
+
+			newTexture, err := textureFromJPEG(renderer, frame)
+			if err != nil {
+				return err
+			}
+
+			if texture != nil {
+				texture.Destroy()
+			}
+
+			texture = newTexture
+
+		default:
+		}
+
+		renderer.SetDrawColor(0, 0, 0, 255)
+		renderer.Clear()
+
+		if texture != nil {
+			dst := sdl.Rect{
+				X: 0,
+				Y: 0,
+				W: outW,
+				H: outH,
+			}
+
+			if err := renderer.Copy(texture, nil, &dst); err != nil {
+				return err
+			}
+		}
+
+		if err := drawFinishLine(renderer, outW, outH); err != nil {
+			return err
+		}
+
+		renderer.Present()
+
+		sdl.Delay(16)
+	}
+}
+
 func displayFrame(
 	renderer *sdl.Renderer,
 	font *ttf.Font,
@@ -102,28 +363,20 @@ func displayFrame(
 		return err
 	}
 
-	// NEW: draw finish line in the middle of the screen
-	lineX := outW / 2
-
-	renderer.SetDrawColor(255, 0, 0, 255)
-
-	// draw a slightly thicker vertical line
-	if err := renderer.DrawLine(lineX-1, 0, lineX-1, outH); err != nil {
-		return err
-	}
-	if err := renderer.DrawLine(lineX, 0, lineX, outH); err != nil {
-		return err
-	}
-	if err := renderer.DrawLine(lineX+1, 0, lineX+1, outH); err != nil {
+	if err := drawFinishLine(renderer, outW, outH); err != nil {
 		return err
 	}
 
-	// elapsed time label
 	label := fmt.Sprintf("%.3f s", elapsed.Seconds())
 
 	surface, err := font.RenderUTF8Blended(
 		label,
-		sdl.Color{R: 255, G: 255, B: 255, A: 255},
+		sdl.Color{
+			R: 255,
+			G: 255,
+			B: 255,
+			A: 255,
+		},
 	)
 	if err != nil {
 		return err
@@ -155,10 +408,10 @@ func displayFrame(
 func reviewFrames(
 	frames []FrameMetadata,
 	renderer *sdl.Renderer,
-	font *ttf.Font, // NEW
+	font *ttf.Font,
 	outW int32,
 	outH int32,
-	t0 time.Time, // NEW
+	t0 time.Time,
 ) {
 	index := len(frames) / 2
 	reader := bufio.NewReader(os.Stdin)
@@ -169,9 +422,11 @@ func reviewFrames(
 			return
 		}
 
-		frameTime := time.Unix(0, frames[index].FrameWallClock)
+		frameTime := time.Unix(
+			0,
+			frames[index].FrameWallClock,
+		)
 
-		// NEW: actual elapsed time from T0 to this physical frame
 		elapsed := frameTime.Sub(t0)
 
 		if err := displayFrame(
@@ -215,7 +470,9 @@ func reviewFrames(
 
 		default:
 			n, err := strconv.Atoi(input)
-			if err == nil && n >= 0 && n < len(frames) {
+			if err == nil &&
+				n >= 0 &&
+				n < len(frames) {
 				index = n
 			}
 		}
@@ -223,37 +480,11 @@ func reviewFrames(
 }
 
 func main() {
-	t0 := time.Now().Add(10 * time.Second)
-	delta := 5 * time.Second
-
-	captureStart := t0.Add(delta)
-
-	fmt.Printf("t0: %s\n", t0.Format(time.RFC3339Nano))
-	fmt.Printf("Capture starts: %s\n", captureStart.Format(time.RFC3339Nano))
-
-	time.Sleep(time.Until(captureStart))
-
-	if err := record(); err != nil {
-		fmt.Printf("recording failed: %v\n", err)
-		os.Exit(1)
-	}
-
-	fmt.Println("Recording completed")
-
-	frames, err := loadMetadata("metadata.json")
-	if err != nil {
-		fmt.Printf("failed to load metadata: %v\n", err)
-		os.Exit(1)
-	}
-
-	fmt.Printf("loaded %d frames\n", len(frames))
-
 	if err := sdl.Init(sdl.INIT_VIDEO); err != nil {
 		log.Fatal(err)
 	}
 	defer sdl.Quit()
 
-	// NEW: initialize SDL_ttf
 	if err := ttf.Init(); err != nil {
 		log.Fatal(err)
 	}
@@ -277,7 +508,6 @@ func main() {
 
 	fmt.Printf("SDL output: %dx%d\n", outW, outH)
 
-	// NEW: load one font and reuse it for every frame
 	font, err := ttf.OpenFont(
 		"/usr/share/fonts/truetype/dejavu/DejaVuSans-Bold.ttf",
 		64,
@@ -287,12 +517,48 @@ func main() {
 	}
 	defer font.Close()
 
+	if err := calibrate(
+		renderer,
+		int32(outW),
+		int32(outH),
+	); err != nil {
+		log.Fatal(err)
+	}
+
+	t0 := time.Now().Add(10 * time.Second)
+	delta := 5 * time.Second
+
+	captureStart := t0.Add(delta)
+
+	fmt.Printf("t0: %s\n", t0.Format(time.RFC3339Nano))
+	fmt.Printf(
+		"Capture starts: %s\n",
+		captureStart.Format(time.RFC3339Nano),
+	)
+
+	time.Sleep(time.Until(captureStart))
+
+	if err := record(); err != nil {
+		fmt.Printf("recording failed: %v\n", err)
+		os.Exit(1)
+	}
+
+	fmt.Println("Recording completed")
+
+	frames, err := loadMetadata("metadata.json")
+	if err != nil {
+		fmt.Printf("failed to load metadata: %v\n", err)
+		os.Exit(1)
+	}
+
+	fmt.Printf("loaded %d frames\n", len(frames))
+
 	reviewFrames(
 		frames,
 		renderer,
-		font, // NEW
+		font,
 		int32(outW),
 		int32(outH),
-		t0, // NEW
+		t0,
 	)
 }
