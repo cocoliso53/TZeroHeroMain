@@ -27,7 +27,8 @@ python3 tools/gun_server.py
 ```
 
 It listens on port `4040`, prints messages to the terminal, and writes them to
-`gun-comms.log`. Stop it with `Ctrl+C`.
+`gun-comms.log`. It also measures clock offset and network round-trip time over
+UDP port `4041`. Stop it with `Ctrl+C`.
 
 ## Stack
 

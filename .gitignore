@@ -3,3 +3,4 @@
 *.jpg
 *.json
 gun-comms.log
+__pycache__/
