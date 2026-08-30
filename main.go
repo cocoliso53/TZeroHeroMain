@@ -517,6 +517,12 @@ func main() {
 	}
 	defer font.Close()
 
+	piReady := make(chan struct{})
+	gunResults, err := startGunCoordinator(piReady)
+	if err != nil {
+		log.Fatal(err)
+	}
+
 	if err := calibrate(
 		renderer,
 		int32(outW),
@@ -525,10 +531,15 @@ func main() {
 		log.Fatal(err)
 	}
 
-	t0, gunConnection, err := waitForGunT0()
-	if err != nil {
-		log.Fatal(err)
+	close(piReady)
+	fmt.Println("Pi ready; waiting for gun readiness and T0")
+
+	gunResult := <-gunResults
+	if gunResult.err != nil {
+		log.Fatal(gunResult.err)
 	}
+	t0 := gunResult.t0
+	gunConnection := gunResult.connection
 	defer gunConnection.Close()
 
 	delta := 5 * time.Second
