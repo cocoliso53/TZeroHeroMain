@@ -525,16 +525,26 @@ func main() {
 		log.Fatal(err)
 	}
 
-	t0 := time.Now().Add(10 * time.Second)
+	t0, gunConnection, err := waitForGunT0()
+	if err != nil {
+		log.Fatal(err)
+	}
+	defer gunConnection.Close()
+
 	delta := 5 * time.Second
 
 	captureStart := t0.Add(delta)
 
-	fmt.Printf("t0: %s\n", t0.Format(time.RFC3339Nano))
+	fmt.Printf("t0: %s\n", t0.UTC().Format(time.RFC3339Nano))
 	fmt.Printf(
 		"Capture starts: %s\n",
-		captureStart.Format(time.RFC3339Nano),
+		captureStart.UTC().Format(time.RFC3339Nano),
 	)
+
+	go func() {
+		time.Sleep(time.Until(t0))
+		fmt.Printf("T0 reached: %s\n", time.Now().UTC().Format(time.RFC3339Nano))
+	}()
 
 	time.Sleep(time.Until(captureStart))
 
