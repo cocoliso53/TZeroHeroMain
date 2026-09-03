@@ -18,10 +18,21 @@ The first version focuses on:
 
 ESP32 synchronization and UI will be handled separately as the project evolves.
 
+## Gun communication test
+
+Start the temporary TCP server on the Raspberry Pi:
+
+```sh
+python3 tools/gun_server.py
+```
+
+It listens on port `4040`, prints messages to the terminal, and writes them to
+`gun-comms.log`. It also measures clock offset and network round-trip time over
+UDP port `4041`. Stop it with `Ctrl+C`.
+
 ## Stack
 
 * Go
 * Raspberry Pi OS Lite
 * rpicam-apps
 * Raspberry Pi Camera Module 3
-

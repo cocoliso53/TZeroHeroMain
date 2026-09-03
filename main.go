@@ -517,6 +517,12 @@ func main() {
 	}
 	defer font.Close()
 
+	piReady := make(chan struct{})
+	gunResults, err := startGunCoordinator(piReady)
+	if err != nil {
+		log.Fatal(err)
+	}
+
 	if err := calibrate(
 		renderer,
 		int32(outW),
@@ -525,16 +531,31 @@ func main() {
 		log.Fatal(err)
 	}
 
-	t0 := time.Now().Add(10 * time.Second)
+	close(piReady)
+	fmt.Println("Pi ready; waiting for gun readiness and T0")
+
+	gunResult := <-gunResults
+	if gunResult.err != nil {
+		log.Fatal(gunResult.err)
+	}
+	t0 := gunResult.t0
+	gunConnection := gunResult.connection
+	defer gunConnection.Close()
+
 	delta := 5 * time.Second
 
 	captureStart := t0.Add(delta)
 
-	fmt.Printf("t0: %s\n", t0.Format(time.RFC3339Nano))
+	fmt.Printf("t0: %s\n", t0.UTC().Format(time.RFC3339Nano))
 	fmt.Printf(
 		"Capture starts: %s\n",
-		captureStart.Format(time.RFC3339Nano),
+		captureStart.UTC().Format(time.RFC3339Nano),
 	)
+
+	go func() {
+		time.Sleep(time.Until(t0))
+		fmt.Printf("T0 reached: %s\n", time.Now().UTC().Format(time.RFC3339Nano))
+	}()
 
 	time.Sleep(time.Until(captureStart))
 

@@ -2,3 +2,6 @@
 *.png
 *.jpg
 *.json
+gun-comms.log
+__pycache__/
+tzerohero
