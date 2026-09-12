@@ -213,42 +213,10 @@ func handleGunSession(connection net.Conn, piReady <-chan struct{}) (time.Time, 
 			if _, err := fmt.Fprintln(connection, "WELCOME"); err != nil {
 				return time.Time{}, err
 			}
-			log.Printf("Gun online; waiting for Pi camera calibration")
+			log.Printf("Gun online; starting clock synchronization")
 			break
 		}
 	}
-
-	<-piReady
-	log.Printf("Pi ready; requesting gun readiness")
-	if _, err := fmt.Fprintln(connection, "PI_READY"); err != nil {
-		return time.Time{}, err
-	}
-
-	if err := connection.SetReadDeadline(time.Now().Add(5 * time.Second)); err != nil {
-		return time.Time{}, err
-	}
-	for {
-		line, err := reader.ReadString('\n')
-		if err != nil {
-			return time.Time{}, err
-		}
-
-		message := strings.TrimSpace(line)
-		log.Printf("Gun RX: %s", message)
-		if strings.HasPrefix(message, "PING ") {
-			if err := respondToHeartbeat(connection, message); err != nil {
-				return time.Time{}, err
-			}
-			continue
-		}
-		if message == "GUN_READY" {
-			break
-		}
-	}
-	if err := connection.SetReadDeadline(time.Time{}); err != nil {
-		return time.Time{}, err
-	}
-	log.Printf("Both devices ready; starting clock synchronization")
 
 	best, err := synchronizeGun(gunIP)
 	if err != nil {
@@ -270,6 +238,57 @@ func handleGunSession(connection net.Conn, piReady <-chan struct{}) (time.Time, 
 		estimatedGunReceiveUTC,
 		oneWayUS,
 	)
+
+	if err := connection.SetReadDeadline(time.Now().Add(5 * time.Second)); err != nil {
+		return time.Time{}, err
+	}
+	for {
+		line, err := reader.ReadString('\n')
+		if err != nil {
+			return time.Time{}, err
+		}
+
+		message := strings.TrimSpace(line)
+		log.Printf("Gun RX: %s", message)
+		if strings.HasPrefix(message, "PING ") {
+			if err := respondToHeartbeat(connection, message); err != nil {
+				return time.Time{}, err
+			}
+			continue
+		}
+		if message == "CLOCK_SYNCED" {
+			break
+		}
+	}
+	if err := connection.SetReadDeadline(time.Time{}); err != nil {
+		return time.Time{}, err
+	}
+	log.Printf("Gun clock synchronized; waiting for Pi camera calibration")
+
+	<-piReady
+	if _, err := fmt.Fprintln(connection, "PI_READY"); err != nil {
+		return time.Time{}, err
+	}
+
+	if err := connection.SetReadDeadline(time.Now().Add(5 * time.Second)); err != nil {
+		return time.Time{}, err
+	}
+	for {
+		line, err := reader.ReadString('\n')
+		if err != nil {
+			return time.Time{}, err
+		}
+
+		message := strings.TrimSpace(line)
+		log.Printf("Gun RX: %s", message)
+		if message == "GUN_READY" {
+			break
+		}
+	}
+	if err := connection.SetReadDeadline(time.Time{}); err != nil {
+		return time.Time{}, err
+	}
+	log.Printf("Both devices ready; waiting for button press and T0")
 
 	for {
 		line, err := reader.ReadString('\n')
