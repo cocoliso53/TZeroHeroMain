@@ -9,10 +9,10 @@ import (
 )
 
 const (
-	calibrationButtonGPIO = 17
-	previousButtonGPIO    = 27
-	nextButtonGPIO        = 22
-	buttonDebounce        = 30 * time.Millisecond
+	newSprintButtonGPIO = 17
+	previousButtonGPIO  = 27
+	nextButtonGPIO      = 22
+	buttonDebounce      = 30 * time.Millisecond
 )
 
 type buttonAction uint8
@@ -44,7 +44,7 @@ func startPiButtons() (*piButtons, error) {
 	}
 
 	pins := []debouncedPin{
-		{pin: rpio.Pin(calibrationButtonGPIO), action: buttonConfirm},
+		{pin: rpio.Pin(newSprintButtonGPIO), action: buttonConfirm},
 		{pin: rpio.Pin(previousButtonGPIO), action: buttonPrevious},
 		{pin: rpio.Pin(nextButtonGPIO), action: buttonNext},
 	}
