@@ -152,10 +152,28 @@ func textureFromJPEG(
 	return img.LoadTextureRW(renderer, rw, true)
 }
 
+func readTerminalCommands() <-chan string {
+	commands := make(chan string)
+	go func() {
+		defer close(commands)
+		reader := bufio.NewReader(os.Stdin)
+		for {
+			text, err := reader.ReadString('\n')
+			if err != nil {
+				return
+			}
+			commands <- strings.TrimSpace(text)
+		}
+	}()
+	return commands
+}
+
 func calibrate(
 	renderer *sdl.Renderer,
 	outW int32,
 	outH int32,
+	commands <-chan string,
+	buttonActions <-chan buttonAction,
 ) error {
 	fmt.Println("Calibration mode")
 	fmt.Println("Align the red line with the finish line.")
@@ -215,23 +233,6 @@ func calibrate(
 		}
 	}()
 
-	// NEW: terminal input, same style as review mode
-	input := make(chan string)
-
-	go func() {
-		reader := bufio.NewReader(os.Stdin)
-
-		for {
-			text, err := reader.ReadString('\n')
-			if err != nil {
-				close(input)
-				return
-			}
-
-			input <- strings.TrimSpace(text)
-		}
-	}()
-
 	var texture *sdl.Texture
 
 	stopCamera := func() {
@@ -249,12 +250,11 @@ func calibrate(
 	}()
 
 	for {
-		// NEW: terminal commands
 		select {
-		case command, ok := <-input:
+		case command, ok := <-commands:
 			if !ok {
-				stopCamera()
-				return fmt.Errorf("stdin closed")
+				commands = nil
+				break
 			}
 
 			switch command {
@@ -276,6 +276,19 @@ func calibrate(
 
 			default:
 				fmt.Print("[s]tart [q]uit > ")
+			}
+
+		case action := <-buttonActions:
+			if action == buttonConfirm {
+				fmt.Println("Calibration confirmed with physical button")
+				stopCamera()
+
+				if texture != nil {
+					texture.Destroy()
+					texture = nil
+				}
+
+				return nil
 			}
 
 		default:
@@ -412,9 +425,10 @@ func reviewFrames(
 	outW int32,
 	outH int32,
 	t0 time.Time,
+	commands <-chan string,
+	buttonActions <-chan buttonAction,
 ) {
 	index := len(frames) / 2
-	reader := bufio.NewReader(os.Stdin)
 
 	for {
 		if err := extractFrame(index); err != nil {
@@ -451,8 +465,25 @@ func reviewFrames(
 
 		fmt.Print("[n]ext [p]revious [number] [q]uit > ")
 
-		input, _ := reader.ReadString('\n')
-		input = strings.TrimSpace(input)
+		var input string
+		select {
+		case command, ok := <-commands:
+			if !ok {
+				commands = nil
+				continue
+			}
+			input = command
+
+		case action := <-buttonActions:
+			switch action {
+			case buttonPrevious:
+				input = "p"
+			case buttonNext:
+				input = "n"
+			default:
+				continue
+			}
+		}
 
 		switch input {
 		case "n":
@@ -517,6 +548,17 @@ func main() {
 	}
 	defer font.Close()
 
+	commands := readTerminalCommands()
+	var buttonActions <-chan buttonAction
+	buttons, err := startPiButtons()
+	if err != nil {
+		log.Printf("Physical buttons disabled: %v", err)
+	} else {
+		defer buttons.Close()
+		buttonActions = buttons.actions
+		fmt.Println("Physical buttons ready: GPIO17 calibrate, GPIO27 previous, GPIO22 next")
+	}
+
 	piReady := make(chan struct{})
 	gunResults, err := startGunCoordinator(piReady)
 	if err != nil {
@@ -527,6 +569,8 @@ func main() {
 		renderer,
 		int32(outW),
 		int32(outH),
+		commands,
+		buttonActions,
 	); err != nil {
 		log.Fatal(err)
 	}
@@ -573,6 +617,7 @@ func main() {
 	}
 
 	fmt.Printf("loaded %d frames\n", len(frames))
+	drainButtonActions(buttonActions)
 
 	reviewFrames(
 		frames,
@@ -581,5 +626,7 @@ func main() {
 		int32(outW),
 		int32(outH),
 		t0,
+		commands,
+		buttonActions,
 	)
 }
