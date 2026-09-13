@@ -7,6 +7,7 @@ import (
 	"net"
 	"strconv"
 	"strings"
+	"sync/atomic"
 	"time"
 )
 
@@ -25,10 +26,13 @@ type clockSample struct {
 	offsetUS    float64
 }
 
-type gunT0Result struct {
-	t0         time.Time
-	connection net.Conn
-	err        error
+type gunCoordinator struct {
+	t0s       chan time.Time
+	accepting atomic.Bool
+}
+
+func (coordinator *gunCoordinator) setAccepting(accepting bool) {
+	coordinator.accepting.Store(accepting)
 }
 
 func monotonicMicroseconds() int64 {
@@ -131,63 +135,38 @@ func respondToHeartbeat(connection net.Conn, message string) error {
 	return err
 }
 
-func monitorGun(connection net.Conn, reader *bufio.Reader) {
-	for {
-		line, err := reader.ReadString('\n')
-		if err != nil {
-			log.Printf("Gun disconnected: %v", err)
-			return
-		}
-
-		message := strings.TrimSpace(line)
-		if strings.HasPrefix(message, "PING ") {
-			if err := respondToHeartbeat(connection, message); err != nil {
-				log.Printf("Gun heartbeat response failed: %v", err)
-				return
-			}
-		}
-	}
-}
-
-func startGunCoordinator(piReady <-chan struct{}) (<-chan gunT0Result, error) {
+func startGunCoordinator() (*gunCoordinator, error) {
 	listener, err := net.Listen("tcp", fmt.Sprintf(":%d", gunTCPPort))
 	if err != nil {
 		return nil, err
 	}
 
-	results := make(chan gunT0Result, 1)
-	go func() {
-		defer listener.Close()
-		t0, connection, err := waitForGunT0(listener, piReady)
-		results <- gunT0Result{t0: t0, connection: connection, err: err}
-	}()
-
-	return results, nil
+	coordinator := &gunCoordinator{t0s: make(chan time.Time, 1)}
+	go coordinator.serve(listener)
+	return coordinator, nil
 }
 
-func waitForGunT0(listener net.Listener, piReady <-chan struct{}) (time.Time, net.Conn, error) {
+func (coordinator *gunCoordinator) serve(listener net.Listener) {
+	defer listener.Close()
 	for {
 		log.Printf("Waiting for gun on TCP port %d", gunTCPPort)
 		connection, err := listener.Accept()
 		if err != nil {
-			return time.Time{}, nil, err
+			log.Printf("Gun listener failed: %v", err)
+			return
 		}
 
-		t0, err := handleGunSession(connection, piReady)
-		if err != nil {
+		if err := coordinator.handleSession(connection); err != nil {
 			log.Printf("Gun session failed: %v; waiting for reconnection", err)
-			connection.Close()
-			continue
 		}
-
-		return t0, connection, nil
+		connection.Close()
 	}
 }
 
-func handleGunSession(connection net.Conn, piReady <-chan struct{}) (time.Time, error) {
+func (coordinator *gunCoordinator) handleSession(connection net.Conn) error {
 	remoteHost, _, err := net.SplitHostPort(connection.RemoteAddr().String())
 	if err != nil {
-		return time.Time{}, err
+		return err
 	}
 	gunIP := net.ParseIP(remoteHost)
 	reader := bufio.NewReader(connection)
@@ -196,7 +175,7 @@ func handleGunSession(connection net.Conn, piReady <-chan struct{}) (time.Time, 
 	for {
 		line, err := reader.ReadString('\n')
 		if err != nil {
-			return time.Time{}, err
+			return err
 		}
 
 		message := strings.TrimSpace(line)
@@ -204,55 +183,23 @@ func handleGunSession(connection net.Conn, piReady <-chan struct{}) (time.Time, 
 
 		if strings.HasPrefix(message, "PING ") {
 			if err := respondToHeartbeat(connection, message); err != nil {
-				return time.Time{}, err
+				return err
 			}
 			continue
 		}
 
 		if strings.HasPrefix(message, "HELLO ") {
 			if _, err := fmt.Fprintln(connection, "WELCOME"); err != nil {
-				return time.Time{}, err
+				return err
 			}
-			log.Printf("Gun online; waiting for Pi camera calibration")
+			log.Printf("Gun online; starting clock synchronization")
 			break
 		}
 	}
-
-	<-piReady
-	log.Printf("Pi ready; requesting gun readiness")
-	if _, err := fmt.Fprintln(connection, "PI_READY"); err != nil {
-		return time.Time{}, err
-	}
-
-	if err := connection.SetReadDeadline(time.Now().Add(5 * time.Second)); err != nil {
-		return time.Time{}, err
-	}
-	for {
-		line, err := reader.ReadString('\n')
-		if err != nil {
-			return time.Time{}, err
-		}
-
-		message := strings.TrimSpace(line)
-		log.Printf("Gun RX: %s", message)
-		if strings.HasPrefix(message, "PING ") {
-			if err := respondToHeartbeat(connection, message); err != nil {
-				return time.Time{}, err
-			}
-			continue
-		}
-		if message == "GUN_READY" {
-			break
-		}
-	}
-	if err := connection.SetReadDeadline(time.Time{}); err != nil {
-		return time.Time{}, err
-	}
-	log.Printf("Both devices ready; starting clock synchronization")
 
 	best, err := synchronizeGun(gunIP)
 	if err != nil {
-		return time.Time{}, err
+		return err
 	}
 
 	oneWayUS := best.roundTripUS / 2
@@ -263,7 +210,7 @@ func handleGunSession(connection net.Conn, piReady <-chan struct{}) (time.Time, 
 		estimatedGunReceiveUTC,
 		oneWayUS,
 	); err != nil {
-		return time.Time{}, err
+		return err
 	}
 	log.Printf(
 		"Clock reference sent utc_ns=%d one_way_us=%d",
@@ -271,10 +218,36 @@ func handleGunSession(connection net.Conn, piReady <-chan struct{}) (time.Time, 
 		oneWayUS,
 	)
 
+	if err := connection.SetReadDeadline(time.Now().Add(5 * time.Second)); err != nil {
+		return err
+	}
 	for {
 		line, err := reader.ReadString('\n')
 		if err != nil {
-			return time.Time{}, err
+			return err
+		}
+
+		message := strings.TrimSpace(line)
+		log.Printf("Gun RX: %s", message)
+		if strings.HasPrefix(message, "PING ") {
+			if err := respondToHeartbeat(connection, message); err != nil {
+				return err
+			}
+			continue
+		}
+		if message == "CLOCK_SYNCED" {
+			break
+		}
+	}
+	if err := connection.SetReadDeadline(time.Time{}); err != nil {
+		return err
+	}
+	log.Printf("Gun clock synchronized; waiting for T0 proposals")
+
+	for {
+		line, err := reader.ReadString('\n')
+		if err != nil {
+			return err
 		}
 
 		message := strings.TrimSpace(line)
@@ -282,29 +255,35 @@ func handleGunSession(connection net.Conn, piReady <-chan struct{}) (time.Time, 
 		switch {
 		case strings.HasPrefix(message, "PING "):
 			if err := respondToHeartbeat(connection, message); err != nil {
-				return time.Time{}, err
+				return err
 			}
 
 		case strings.HasPrefix(message, "T0 "):
 			t0Nanoseconds, err := strconv.ParseInt(strings.TrimSpace(message[3:]), 10, 64)
 			if err != nil {
-				fmt.Fprintln(connection, "CANCEL invalid-t0")
+				fmt.Fprintln(connection, "REJECT_T0 0 invalid-t0")
 				continue
 			}
 
 			t0 := time.Unix(0, t0Nanoseconds)
 			if time.Until(t0) <= 0 {
-				fmt.Fprintln(connection, "CANCEL expired-t0")
+				fmt.Fprintf(connection, "REJECT_T0 %d expired\n", t0Nanoseconds)
+				continue
+			}
+
+			if !coordinator.accepting.CompareAndSwap(true, false) {
+				fmt.Fprintf(connection, "REJECT_T0 %d busy\n", t0Nanoseconds)
+				log.Printf("T0 rejected while Pi busy: %s", t0.UTC().Format(time.RFC3339Nano))
 				continue
 			}
 
 			if _, err := fmt.Fprintf(connection, "ACK_T0 %d\n", t0Nanoseconds); err != nil {
-				return time.Time{}, err
+				coordinator.accepting.Store(true)
+				return err
 			}
 
 			log.Printf("T0 acknowledged: %s", t0.UTC().Format(time.RFC3339Nano))
-			go monitorGun(connection, reader)
-			return t0, nil
+			coordinator.t0s <- t0
 		}
 	}
 }

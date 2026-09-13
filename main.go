@@ -3,6 +3,7 @@ package main
 import (
 	"bufio"
 	"encoding/json"
+	"errors"
 	"fmt"
 	"io"
 	"log"
@@ -152,14 +153,34 @@ func textureFromJPEG(
 	return img.LoadTextureRW(renderer, rw, true)
 }
 
-func calibrate(
+func readTerminalCommands() <-chan string {
+	commands := make(chan string)
+	go func() {
+		defer close(commands)
+		reader := bufio.NewReader(os.Stdin)
+		for {
+			text, err := reader.ReadString('\n')
+			if err != nil {
+				return
+			}
+			commands <- strings.TrimSpace(text)
+		}
+	}()
+	return commands
+}
+
+var errQuitRequested = errors.New("quit requested")
+
+func waitForT0WithPreview(
 	renderer *sdl.Renderer,
 	outW int32,
 	outH int32,
-) error {
-	fmt.Println("Calibration mode")
-	fmt.Println("Align the red line with the finish line.")
-	fmt.Print("[s]tart [q]uit > ")
+	commands <-chan string,
+	buttonActions <-chan buttonAction,
+	coordinator *gunCoordinator,
+) (time.Time, error) {
+	fmt.Println("Live calibration mode; waiting for gun T0")
+	fmt.Print("[q]uit > ")
 
 	cmd := exec.Command(
 		"rpicam-vid",
@@ -174,14 +195,17 @@ func calibrate(
 
 	stdout, err := cmd.StdoutPipe()
 	if err != nil {
-		return err
+		return time.Time{}, err
 	}
 
 	cmd.Stderr = os.Stderr
 
 	if err := cmd.Start(); err != nil {
-		return err
+		return time.Time{}, err
 	}
+
+	coordinator.setAccepting(true)
+	defer coordinator.setAccepting(false)
 
 	frames := make(chan []byte, 1)
 
@@ -215,23 +239,6 @@ func calibrate(
 		}
 	}()
 
-	// NEW: terminal input, same style as review mode
-	input := make(chan string)
-
-	go func() {
-		reader := bufio.NewReader(os.Stdin)
-
-		for {
-			text, err := reader.ReadString('\n')
-			if err != nil {
-				close(input)
-				return
-			}
-
-			input <- strings.TrimSpace(text)
-		}
-	}()
-
 	var texture *sdl.Texture
 
 	stopCamera := func() {
@@ -249,34 +256,35 @@ func calibrate(
 	}()
 
 	for {
-		// NEW: terminal commands
 		select {
-		case command, ok := <-input:
+		case t0 := <-coordinator.t0s:
+			fmt.Printf("T0 accepted: %s\n", t0.UTC().Format(time.RFC3339Nano))
+			stopCamera()
+			if texture != nil {
+				texture.Destroy()
+				texture = nil
+			}
+			renderer.SetDrawColor(0, 0, 0, 255)
+			renderer.Clear()
+			renderer.Present()
+			return t0, nil
+
+		case command, ok := <-commands:
 			if !ok {
-				stopCamera()
-				return fmt.Errorf("stdin closed")
+				commands = nil
+				break
 			}
 
 			switch command {
-			case "s":
-				fmt.Println("Starting sprint sequence")
-
-				stopCamera()
-
-				if texture != nil {
-					texture.Destroy()
-					texture = nil
-				}
-
-				return nil
-
 			case "q":
 				stopCamera()
-				os.Exit(0)
+				return time.Time{}, errQuitRequested
 
 			default:
-				fmt.Print("[s]tart [q]uit > ")
+				fmt.Print("[q]uit > ")
 			}
+
+		case <-buttonActions:
 
 		default:
 		}
@@ -286,19 +294,19 @@ func calibrate(
 			switch event.(type) {
 			case *sdl.QuitEvent:
 				stopCamera()
-				os.Exit(0)
+				return time.Time{}, errQuitRequested
 			}
 		}
 
 		select {
 		case frame, ok := <-frames:
 			if !ok {
-				return fmt.Errorf("camera preview stopped unexpectedly")
+				return time.Time{}, fmt.Errorf("camera preview stopped unexpectedly")
 			}
 
 			newTexture, err := textureFromJPEG(renderer, frame)
 			if err != nil {
-				return err
+				return time.Time{}, err
 			}
 
 			if texture != nil {
@@ -322,12 +330,12 @@ func calibrate(
 			}
 
 			if err := renderer.Copy(texture, nil, &dst); err != nil {
-				return err
+				return time.Time{}, err
 			}
 		}
 
 		if err := drawFinishLine(renderer, outW, outH); err != nil {
-			return err
+			return time.Time{}, err
 		}
 
 		renderer.Present()
@@ -405,6 +413,107 @@ func displayFrame(
 	return nil
 }
 
+func displayBlack(renderer *sdl.Renderer) error {
+	if err := renderer.SetDrawColor(0, 0, 0, 255); err != nil {
+		return err
+	}
+	if err := renderer.Clear(); err != nil {
+		return err
+	}
+	renderer.Present()
+	return nil
+}
+
+func displayStopwatch(
+	renderer *sdl.Renderer,
+	font *ttf.Font,
+	outW int32,
+	outH int32,
+	elapsed time.Duration,
+) error {
+	if elapsed < 0 {
+		return displayBlack(renderer)
+	}
+
+	label := fmt.Sprintf("%.3f", elapsed.Seconds())
+	surface, err := font.RenderUTF8Blended(label, sdl.Color{R: 255, G: 255, B: 255, A: 255})
+	if err != nil {
+		return err
+	}
+	defer surface.Free()
+
+	textTexture, err := renderer.CreateTextureFromSurface(surface)
+	if err != nil {
+		return err
+	}
+	defer textTexture.Destroy()
+
+	if err := renderer.SetDrawColor(0, 0, 0, 255); err != nil {
+		return err
+	}
+	if err := renderer.Clear(); err != nil {
+		return err
+	}
+
+	textRect := sdl.Rect{
+		X: (outW - surface.W) / 2,
+		Y: (outH - surface.H) / 2,
+		W: surface.W,
+		H: surface.H,
+	}
+	if err := renderer.Copy(textTexture, nil, &textRect); err != nil {
+		return err
+	}
+	renderer.Present()
+	return nil
+}
+
+func recordWithStopwatch(
+	renderer *sdl.Renderer,
+	font *ttf.Font,
+	outW int32,
+	outH int32,
+	t0 time.Time,
+) error {
+	captureStart := t0.Add(5 * time.Second)
+	fmt.Printf("Capture starts: %s\n", captureStart.UTC().Format(time.RFC3339Nano))
+
+	recordingDone := make(chan error, 1)
+	go func() {
+		if wait := time.Until(captureStart); wait > 0 {
+			time.Sleep(wait)
+		}
+		recordingDone <- record()
+	}()
+
+	ticker := time.NewTicker(16 * time.Millisecond)
+	defer ticker.Stop()
+	t0Logged := false
+
+	for {
+		now := time.Now()
+		if !t0Logged && !now.Before(t0) {
+			t0Logged = true
+			fmt.Printf("T0 reached: %s\n", now.UTC().Format(time.RFC3339Nano))
+		}
+		if err := displayStopwatch(renderer, font, outW, outH, now.Sub(t0)); err != nil {
+			return err
+		}
+
+		for event := sdl.PollEvent(); event != nil; event = sdl.PollEvent() {
+			if _, ok := event.(*sdl.QuitEvent); ok {
+				return errQuitRequested
+			}
+		}
+
+		select {
+		case err := <-recordingDone:
+			return err
+		case <-ticker.C:
+		}
+	}
+}
+
 func reviewFrames(
 	frames []FrameMetadata,
 	renderer *sdl.Renderer,
@@ -412,14 +521,15 @@ func reviewFrames(
 	outW int32,
 	outH int32,
 	t0 time.Time,
-) {
+	commands <-chan string,
+	buttonActions <-chan buttonAction,
+) bool {
 	index := len(frames) / 2
-	reader := bufio.NewReader(os.Stdin)
 
 	for {
 		if err := extractFrame(index); err != nil {
 			fmt.Printf("failed to extract frame: %v\n", err)
-			return
+			return false
 		}
 
 		frameTime := time.Unix(
@@ -437,7 +547,7 @@ func reviewFrames(
 			elapsed,
 		); err != nil {
 			fmt.Printf("failed to display frame: %v\n", err)
-			return
+			return false
 		}
 
 		fmt.Printf(
@@ -449,10 +559,29 @@ func reviewFrames(
 			elapsed.Seconds(),
 		)
 
-		fmt.Print("[n]ext [p]revious [number] [q]uit > ")
+		fmt.Print("[n]ext [p]revious [number] [q]uit; GPIO17 new sprint > ")
 
-		input, _ := reader.ReadString('\n')
-		input = strings.TrimSpace(input)
+		var input string
+		select {
+		case command, ok := <-commands:
+			if !ok {
+				commands = nil
+				continue
+			}
+			input = command
+
+		case action := <-buttonActions:
+			switch action {
+			case buttonConfirm:
+				return true
+			case buttonPrevious:
+				input = "p"
+			case buttonNext:
+				input = "n"
+			default:
+				continue
+			}
+		}
 
 		switch input {
 		case "n":
@@ -466,7 +595,7 @@ func reviewFrames(
 			}
 
 		case "q":
-			return
+			return false
 
 		default:
 			n, err := strconv.Atoi(input)
@@ -517,69 +646,74 @@ func main() {
 	}
 	defer font.Close()
 
-	piReady := make(chan struct{})
-	gunResults, err := startGunCoordinator(piReady)
+	commands := readTerminalCommands()
+	var buttonActions <-chan buttonAction
+	buttons, err := startPiButtons()
+	if err != nil {
+		log.Printf("Physical buttons disabled: %v", err)
+	} else {
+		defer buttons.Close()
+		buttonActions = buttons.actions
+		fmt.Println("Physical buttons ready: GPIO17 new sprint, GPIO27 previous, GPIO22 next")
+	}
+
+	coordinator, err := startGunCoordinator()
 	if err != nil {
 		log.Fatal(err)
 	}
 
-	if err := calibrate(
-		renderer,
-		int32(outW),
-		int32(outH),
-	); err != nil {
-		log.Fatal(err)
+	for {
+		drainButtonActions(buttonActions)
+		t0, err := waitForT0WithPreview(
+			renderer,
+			int32(outW),
+			int32(outH),
+			commands,
+			buttonActions,
+			coordinator,
+		)
+		if errors.Is(err, errQuitRequested) {
+			return
+		}
+		if err != nil {
+			log.Printf("live preview failed: %v", err)
+			return
+		}
+
+		fmt.Printf("t0: %s\n", t0.UTC().Format(time.RFC3339Nano))
+		if err := recordWithStopwatch(
+			renderer,
+			font,
+			int32(outW),
+			int32(outH),
+			t0,
+		); err != nil {
+			if !errors.Is(err, errQuitRequested) {
+				log.Printf("recording failed: %v", err)
+			}
+			return
+		}
+
+		fmt.Println("Recording completed")
+		frames, err := loadMetadata("metadata.json")
+		if err != nil {
+			log.Printf("failed to load metadata: %v", err)
+			return
+		}
+
+		fmt.Printf("loaded %d frames\n", len(frames))
+		drainButtonActions(buttonActions)
+		if !reviewFrames(
+			frames,
+			renderer,
+			font,
+			int32(outW),
+			int32(outH),
+			t0,
+			commands,
+			buttonActions,
+		) {
+			return
+		}
 	}
-
-	close(piReady)
-	fmt.Println("Pi ready; waiting for gun readiness and T0")
-
-	gunResult := <-gunResults
-	if gunResult.err != nil {
-		log.Fatal(gunResult.err)
-	}
-	t0 := gunResult.t0
-	gunConnection := gunResult.connection
-	defer gunConnection.Close()
-
-	delta := 5 * time.Second
-
-	captureStart := t0.Add(delta)
-
-	fmt.Printf("t0: %s\n", t0.UTC().Format(time.RFC3339Nano))
-	fmt.Printf(
-		"Capture starts: %s\n",
-		captureStart.UTC().Format(time.RFC3339Nano),
-	)
-
-	go func() {
-		time.Sleep(time.Until(t0))
-		fmt.Printf("T0 reached: %s\n", time.Now().UTC().Format(time.RFC3339Nano))
-	}()
-
-	time.Sleep(time.Until(captureStart))
-
-	if err := record(); err != nil {
-		fmt.Printf("recording failed: %v\n", err)
-		os.Exit(1)
-	}
-
-	fmt.Println("Recording completed")
-
-	frames, err := loadMetadata("metadata.json")
-	if err != nil {
-		fmt.Printf("failed to load metadata: %v\n", err)
-		os.Exit(1)
-	}
-
-	fmt.Printf("loaded %d frames\n", len(frames))
-
-	reviewFrames(
-		frames,
-		renderer,
-		font,
-		int32(outW),
-		int32(outH),
-		t0,
-	)
 }
