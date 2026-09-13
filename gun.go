@@ -7,7 +7,7 @@ import (
 	"net"
 	"strconv"
 	"strings"
-	"sync/atomic"
+	"sync"
 	"time"
 )
 
@@ -28,11 +28,46 @@ type clockSample struct {
 
 type gunCoordinator struct {
 	t0s       chan time.Time
-	accepting atomic.Bool
+	mutex     sync.Mutex
+	accepting bool
+	activeT0  int64
 }
 
 func (coordinator *gunCoordinator) setAccepting(accepting bool) {
-	coordinator.accepting.Store(accepting)
+	coordinator.mutex.Lock()
+	defer coordinator.mutex.Unlock()
+	coordinator.activeT0 = 0
+	coordinator.accepting = accepting
+}
+
+func (coordinator *gunCoordinator) acceptT0(t0Nanoseconds int64) bool {
+	coordinator.mutex.Lock()
+	defer coordinator.mutex.Unlock()
+
+	if !coordinator.accepting {
+		return false
+	}
+
+	if coordinator.activeT0 != 0 &&
+		time.Now().UnixNano() >= coordinator.activeT0 {
+		coordinator.accepting = false
+		coordinator.activeT0 = 0
+		return false
+	}
+
+	coordinator.activeT0 = t0Nanoseconds
+	return true
+}
+
+func (coordinator *gunCoordinator) closeReplacementWindow(t0 time.Time) bool {
+	coordinator.mutex.Lock()
+	defer coordinator.mutex.Unlock()
+	if coordinator.activeT0 != t0.UnixNano() {
+		return false
+	}
+	coordinator.accepting = false
+	coordinator.activeT0 = 0
+	return true
 }
 
 func monotonicMicroseconds() int64 {
@@ -141,7 +176,7 @@ func startGunCoordinator() (*gunCoordinator, error) {
 		return nil, err
 	}
 
-	coordinator := &gunCoordinator{t0s: make(chan time.Time, 1)}
+	coordinator := &gunCoordinator{t0s: make(chan time.Time, 4)}
 	go coordinator.serve(listener)
 	return coordinator, nil
 }
@@ -271,14 +306,13 @@ func (coordinator *gunCoordinator) handleSession(connection net.Conn) error {
 				continue
 			}
 
-			if !coordinator.accepting.CompareAndSwap(true, false) {
+			if !coordinator.acceptT0(t0Nanoseconds) {
 				fmt.Fprintf(connection, "REJECT_T0 %d busy\n", t0Nanoseconds)
 				log.Printf("T0 rejected while Pi busy: %s", t0.UTC().Format(time.RFC3339Nano))
 				continue
 			}
 
 			if _, err := fmt.Fprintf(connection, "ACK_T0 %d\n", t0Nanoseconds); err != nil {
-				coordinator.accepting.Store(true)
 				return err
 			}
 

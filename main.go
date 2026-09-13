@@ -205,7 +205,12 @@ func waitForT0WithPreview(
 	}
 
 	coordinator.setAccepting(true)
-	defer coordinator.setAccepting(false)
+	t0Accepted := false
+	defer func() {
+		if !t0Accepted {
+			coordinator.setAccepting(false)
+		}
+	}()
 
 	frames := make(chan []byte, 1)
 
@@ -258,6 +263,7 @@ func waitForT0WithPreview(
 	for {
 		select {
 		case t0 := <-coordinator.t0s:
+			t0Accepted = true
 			fmt.Printf("T0 accepted: %s\n", t0.UTC().Format(time.RFC3339Nano))
 			stopCamera()
 			if texture != nil {
@@ -431,11 +437,13 @@ func displayStopwatch(
 	outH int32,
 	elapsed time.Duration,
 ) error {
+	var label string
 	if elapsed < 0 {
-		return displayBlack(renderer)
+		label = fmt.Sprintf("START IN %.1f", (-elapsed).Seconds())
+	} else {
+		label = fmt.Sprintf("%.3f", elapsed.Seconds())
 	}
 
-	label := fmt.Sprintf("%.3f", elapsed.Seconds())
 	surface, err := font.RenderUTF8Blended(label, sdl.Color{R: 255, G: 255, B: 255, A: 255})
 	if err != nil {
 		return err
@@ -474,41 +482,75 @@ func recordWithStopwatch(
 	outW int32,
 	outH int32,
 	t0 time.Time,
-) error {
+	coordinator *gunCoordinator,
+) (time.Time, error) {
+	defer coordinator.setAccepting(false)
+
 	captureStart := t0.Add(5 * time.Second)
 	fmt.Printf("Capture starts: %s\n", captureStart.UTC().Format(time.RFC3339Nano))
 
 	recordingDone := make(chan error, 1)
-	go func() {
-		if wait := time.Until(captureStart); wait > 0 {
-			time.Sleep(wait)
-		}
-		recordingDone <- record()
-	}()
+	captureTimer := time.NewTimer(max(time.Until(captureStart), 0))
+	defer captureTimer.Stop()
+	recordingStarted := false
 
 	ticker := time.NewTicker(16 * time.Millisecond)
 	defer ticker.Stop()
 	t0Logged := false
+	applyReplacement := func(replacementT0 time.Time) {
+		t0 = replacementT0
+		captureStart = t0.Add(5 * time.Second)
+		t0Logged = false
+		if !captureTimer.Stop() {
+			select {
+			case <-captureTimer.C:
+			default:
+			}
+		}
+		captureTimer.Reset(max(time.Until(captureStart), 0))
+		fmt.Printf("T0 replaced: %s\n", t0.UTC().Format(time.RFC3339Nano))
+		fmt.Printf("Capture rescheduled: %s\n", captureStart.UTC().Format(time.RFC3339Nano))
+	}
 
 	for {
+		select {
+		case replacementT0 := <-coordinator.t0s:
+			applyReplacement(replacementT0)
+			continue
+		default:
+		}
+
 		now := time.Now()
 		if !t0Logged && !now.Before(t0) {
-			t0Logged = true
-			fmt.Printf("T0 reached: %s\n", now.UTC().Format(time.RFC3339Nano))
+			if coordinator.closeReplacementWindow(t0) {
+				t0Logged = true
+				fmt.Printf("T0 reached: %s\n", now.UTC().Format(time.RFC3339Nano))
+			}
 		}
 		if err := displayStopwatch(renderer, font, outW, outH, now.Sub(t0)); err != nil {
-			return err
+			return t0, err
 		}
 
 		for event := sdl.PollEvent(); event != nil; event = sdl.PollEvent() {
 			if _, ok := event.(*sdl.QuitEvent); ok {
-				return errQuitRequested
+				return t0, errQuitRequested
 			}
 		}
 
 		select {
+		case replacementT0 := <-coordinator.t0s:
+			applyReplacement(replacementT0)
+
+		case <-captureTimer.C:
+			if !recordingStarted {
+				recordingStarted = true
+				go func() {
+					recordingDone <- record()
+				}()
+			}
+
 		case err := <-recordingDone:
-			return err
+			return t0, err
 		case <-ticker.C:
 		}
 	}
@@ -681,13 +723,16 @@ func main() {
 		}
 
 		fmt.Printf("t0: %s\n", t0.UTC().Format(time.RFC3339Nano))
-		if err := recordWithStopwatch(
+		finalT0, err := recordWithStopwatch(
 			renderer,
 			font,
 			int32(outW),
 			int32(outH),
 			t0,
-		); err != nil {
+			coordinator,
+		)
+		t0 = finalT0
+		if err != nil {
 			if !errors.Is(err, errQuitRequested) {
 				log.Printf("recording failed: %v", err)
 			}
