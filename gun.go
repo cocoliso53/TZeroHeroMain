@@ -27,10 +27,12 @@ type clockSample struct {
 }
 
 type gunCoordinator struct {
-	t0s       chan time.Time
-	mutex     sync.Mutex
-	accepting bool
-	activeT0  int64
+	t0s             chan time.Time
+	mutex           sync.Mutex
+	accepting       bool
+	activeT0        int64
+	connectionMutex sync.Mutex
+	connection      net.Conn
 }
 
 func (coordinator *gunCoordinator) setAccepting(accepting bool) {
@@ -68,6 +70,28 @@ func (coordinator *gunCoordinator) closeReplacementWindow(t0 time.Time) bool {
 	coordinator.accepting = false
 	coordinator.activeT0 = 0
 	return true
+}
+
+func (coordinator *gunCoordinator) setConnection(connection net.Conn) {
+	coordinator.connectionMutex.Lock()
+	defer coordinator.connectionMutex.Unlock()
+	coordinator.connection = connection
+}
+
+func (coordinator *gunCoordinator) clearConnection() {
+	coordinator.connectionMutex.Lock()
+	defer coordinator.connectionMutex.Unlock()
+	coordinator.connection = nil
+}
+
+func (coordinator *gunCoordinator) requestT0() error {
+	coordinator.connectionMutex.Lock()
+	defer coordinator.connectionMutex.Unlock()
+	if coordinator.connection == nil {
+		return fmt.Errorf("gun is not synchronized")
+	}
+	_, err := fmt.Fprintln(coordinator.connection, "REQUEST_T0")
+	return err
 }
 
 func monotonicMicroseconds() int64 {
@@ -277,6 +301,8 @@ func (coordinator *gunCoordinator) handleSession(connection net.Conn) error {
 	if err := connection.SetReadDeadline(time.Time{}); err != nil {
 		return err
 	}
+	coordinator.setConnection(connection)
+	defer coordinator.clearConnection()
 	log.Printf("Gun clock synchronized; waiting for T0 proposals")
 
 	for {
@@ -288,6 +314,9 @@ func (coordinator *gunCoordinator) handleSession(connection net.Conn) error {
 		message := strings.TrimSpace(line)
 		log.Printf("Gun RX: %s", message)
 		switch {
+		case strings.HasPrefix(message, "START_REJECT "):
+			log.Printf("Gun rejected start request: %s", strings.TrimPrefix(message, "START_REJECT "))
+
 		case strings.HasPrefix(message, "PING "):
 			if err := respondToHeartbeat(connection, message); err != nil {
 				return err

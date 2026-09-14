@@ -248,7 +248,7 @@ func waitForT0WithPreview(
 ) (time.Time, error) {
 	fmt.Println("Live calibration mode; waiting for gun T0")
 	changeSprintMode(modeIndex, 0)
-	fmt.Print("[n]ext mode [p]revious mode [q]uit > ")
+	fmt.Print("[s]tart [n]ext mode [p]revious mode [q]uit > ")
 
 	cmd := exec.Command(
 		"rpicam-vid",
@@ -279,6 +279,13 @@ func waitForT0WithPreview(
 			coordinator.setAccepting(false)
 		}
 	}()
+	requestGunT0 := func() {
+		if err := coordinator.requestT0(); err != nil {
+			fmt.Printf("Cannot request T0: %v\n", err)
+			return
+		}
+		fmt.Println("T0 requested from gun")
+	}
 
 	frames := make(chan []byte, 1)
 
@@ -351,6 +358,8 @@ func waitForT0WithPreview(
 			}
 
 			switch command {
+			case "s":
+				requestGunT0()
 			case "n":
 				changeSprintMode(modeIndex, 1)
 			case "p":
@@ -360,11 +369,13 @@ func waitForT0WithPreview(
 				return time.Time{}, errQuitRequested
 
 			default:
-				fmt.Print("[n]ext mode [p]revious mode [q]uit > ")
+				fmt.Print("[s]tart [n]ext mode [p]revious mode [q]uit > ")
 			}
 
 		case action := <-buttonActions:
 			switch action {
+			case buttonConfirm:
+				requestGunT0()
 			case buttonPrevious:
 				changeSprintMode(modeIndex, -1)
 			case buttonNext:
@@ -640,6 +651,53 @@ func recordWithStopwatch(
 	}
 }
 
+func frameStepForClicks(clicks int) int {
+	switch clicks {
+	case 1:
+		return 1
+	case 2:
+		return 10
+	case 3:
+		return 50
+	default:
+		return 100
+	}
+}
+
+func collectNavigationClicks(
+	direction buttonAction,
+	buttonActions <-chan buttonAction,
+) (buttonAction, int) {
+	clicks := 1
+	timer := time.NewTimer(400 * time.Millisecond)
+	defer timer.Stop()
+
+	for {
+		select {
+		case action := <-buttonActions:
+			if action == buttonConfirm {
+				return action, 1
+			}
+			if action != direction {
+				direction = action
+				clicks = 1
+			} else {
+				clicks++
+			}
+			if !timer.Stop() {
+				select {
+				case <-timer.C:
+				default:
+				}
+			}
+			timer.Reset(400 * time.Millisecond)
+
+		case <-timer.C:
+			return direction, clicks
+		}
+	}
+}
+
 func reviewFrames(
 	frames []FrameMetadata,
 	renderer *sdl.Renderer,
@@ -688,6 +746,7 @@ func reviewFrames(
 		fmt.Print("[n]ext [p]revious [number] [q]uit; GPIO17 new sprint > ")
 
 		var input string
+		frameDelta := 0
 		select {
 		case command, ok := <-commands:
 			if !ok {
@@ -701,12 +760,37 @@ func reviewFrames(
 			case buttonConfirm:
 				return true
 			case buttonPrevious:
-				input = "p"
+				direction, clicks := collectNavigationClicks(action, buttonActions)
+				if direction == buttonConfirm {
+					return true
+				}
+				step := frameStepForClicks(clicks)
+				fmt.Printf("%d clicks: %d frames\n", clicks, step)
+				if direction == buttonPrevious {
+					frameDelta = -step
+				} else {
+					frameDelta = step
+				}
 			case buttonNext:
-				input = "n"
+				direction, clicks := collectNavigationClicks(action, buttonActions)
+				if direction == buttonConfirm {
+					return true
+				}
+				step := frameStepForClicks(clicks)
+				fmt.Printf("%d clicks: %d frames\n", clicks, step)
+				if direction == buttonPrevious {
+					frameDelta = -step
+				} else {
+					frameDelta = step
+				}
 			default:
 				continue
 			}
+		}
+
+		if frameDelta != 0 {
+			index = max(0, min(len(frames)-1, index+frameDelta))
+			continue
 		}
 
 		switch input {
