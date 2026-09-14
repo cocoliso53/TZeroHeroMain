@@ -23,10 +23,24 @@ type FrameMetadata struct {
 	FrameWallClock int64 `json:"FrameWallClock"`
 }
 
-func record() error {
+type sprintMode struct {
+	name              string
+	captureStartDelay time.Duration
+	recordingDuration time.Duration
+}
+
+var sprintModes = []sprintMode{
+	{name: "Short / Accel", captureStartDelay: 2 * time.Second, recordingDuration: 4 * time.Second},
+	{name: "60 m", captureStartDelay: 6 * time.Second, recordingDuration: 4 * time.Second},
+	{name: "100 m", captureStartDelay: 9 * time.Second, recordingDuration: 7 * time.Second},
+	{name: "150 m", captureStartDelay: 14 * time.Second, recordingDuration: 10 * time.Second},
+	{name: "200 m", captureStartDelay: 19 * time.Second, recordingDuration: 13 * time.Second},
+}
+
+func record(duration time.Duration) error {
 	cmd := exec.Command(
 		"rpicam-vid",
-		"-t", "5000",
+		"-t", strconv.FormatInt(duration.Milliseconds(), 10),
 		"--width", "1280",
 		"--height", "720",
 		"--framerate", "100",
@@ -101,6 +115,57 @@ func drawFinishLine(
 	return nil
 }
 
+func changeSprintMode(index *int, delta int) {
+	*index = (*index + delta + len(sprintModes)) % len(sprintModes)
+	mode := sprintModes[*index]
+	windowEnd := mode.captureStartDelay + mode.recordingDuration
+	fmt.Printf("Mode: %s (%.0f-%.0f seconds)\n", mode.name,
+		mode.captureStartDelay.Seconds(), windowEnd.Seconds())
+}
+
+func drawSprintMode(
+	renderer *sdl.Renderer,
+	font *ttf.Font,
+	outW int32,
+	mode sprintMode,
+) error {
+	windowEnd := mode.captureStartDelay + mode.recordingDuration
+	label := fmt.Sprintf("%s   %.0f-%.0f s", mode.name,
+		mode.captureStartDelay.Seconds(), windowEnd.Seconds())
+	surface, err := font.RenderUTF8Blended(label,
+		sdl.Color{R: 255, G: 255, B: 255, A: 255})
+	if err != nil {
+		return err
+	}
+	defer surface.Free()
+
+	texture, err := renderer.CreateTextureFromSurface(surface)
+	if err != nil {
+		return err
+	}
+	defer texture.Destroy()
+
+	textRect := sdl.Rect{
+		X: (outW - surface.W) / 2,
+		Y: 20,
+		W: surface.W,
+		H: surface.H,
+	}
+	background := sdl.Rect{
+		X: textRect.X - 12,
+		Y: textRect.Y - 8,
+		W: textRect.W + 24,
+		H: textRect.H + 16,
+	}
+	if err := renderer.SetDrawColor(0, 0, 0, 255); err != nil {
+		return err
+	}
+	if err := renderer.FillRect(&background); err != nil {
+		return err
+	}
+	return renderer.Copy(texture, nil, &textRect)
+}
+
 func readJPEG(reader *bufio.Reader) ([]byte, error) {
 	var frame []byte
 
@@ -173,14 +238,17 @@ var errQuitRequested = errors.New("quit requested")
 
 func waitForT0WithPreview(
 	renderer *sdl.Renderer,
+	font *ttf.Font,
 	outW int32,
 	outH int32,
 	commands <-chan string,
 	buttonActions <-chan buttonAction,
 	coordinator *gunCoordinator,
+	modeIndex *int,
 ) (time.Time, error) {
 	fmt.Println("Live calibration mode; waiting for gun T0")
-	fmt.Print("[q]uit > ")
+	changeSprintMode(modeIndex, 0)
+	fmt.Print("[n]ext mode [p]revious mode [q]uit > ")
 
 	cmd := exec.Command(
 		"rpicam-vid",
@@ -264,7 +332,8 @@ func waitForT0WithPreview(
 		select {
 		case t0 := <-coordinator.t0s:
 			t0Accepted = true
-			fmt.Printf("T0 accepted: %s\n", t0.UTC().Format(time.RFC3339Nano))
+			fmt.Printf("T0 accepted for %s: %s\n", sprintModes[*modeIndex].name,
+				t0.UTC().Format(time.RFC3339Nano))
 			stopCamera()
 			if texture != nil {
 				texture.Destroy()
@@ -282,15 +351,25 @@ func waitForT0WithPreview(
 			}
 
 			switch command {
+			case "n":
+				changeSprintMode(modeIndex, 1)
+			case "p":
+				changeSprintMode(modeIndex, -1)
 			case "q":
 				stopCamera()
 				return time.Time{}, errQuitRequested
 
 			default:
-				fmt.Print("[q]uit > ")
+				fmt.Print("[n]ext mode [p]revious mode [q]uit > ")
 			}
 
-		case <-buttonActions:
+		case action := <-buttonActions:
+			switch action {
+			case buttonPrevious:
+				changeSprintMode(modeIndex, -1)
+			case buttonNext:
+				changeSprintMode(modeIndex, 1)
+			}
 
 		default:
 		}
@@ -341,6 +420,9 @@ func waitForT0WithPreview(
 		}
 
 		if err := drawFinishLine(renderer, outW, outH); err != nil {
+			return time.Time{}, err
+		}
+		if err := drawSprintMode(renderer, font, outW, sprintModes[*modeIndex]); err != nil {
 			return time.Time{}, err
 		}
 
@@ -483,11 +565,13 @@ func recordWithStopwatch(
 	outH int32,
 	t0 time.Time,
 	coordinator *gunCoordinator,
+	mode sprintMode,
 ) (time.Time, error) {
 	defer coordinator.setAccepting(false)
 
-	captureStart := t0.Add(5 * time.Second)
-	fmt.Printf("Capture starts: %s\n", captureStart.UTC().Format(time.RFC3339Nano))
+	captureStart := t0.Add(mode.captureStartDelay)
+	fmt.Printf("%s capture starts: %s (duration %.0f s)\n", mode.name,
+		captureStart.UTC().Format(time.RFC3339Nano), mode.recordingDuration.Seconds())
 
 	recordingDone := make(chan error, 1)
 	captureTimer := time.NewTimer(max(time.Until(captureStart), 0))
@@ -499,7 +583,7 @@ func recordWithStopwatch(
 	t0Logged := false
 	applyReplacement := func(replacementT0 time.Time) {
 		t0 = replacementT0
-		captureStart = t0.Add(5 * time.Second)
+		captureStart = t0.Add(mode.captureStartDelay)
 		t0Logged = false
 		if !captureTimer.Stop() {
 			select {
@@ -545,7 +629,7 @@ func recordWithStopwatch(
 			if !recordingStarted {
 				recordingStarted = true
 				go func() {
-					recordingDone <- record()
+					recordingDone <- record(mode.recordingDuration)
 				}()
 			}
 
@@ -704,15 +788,18 @@ func main() {
 		log.Fatal(err)
 	}
 
+	selectedModeIndex := 2
 	for {
 		drainButtonActions(buttonActions)
 		t0, err := waitForT0WithPreview(
 			renderer,
+			font,
 			int32(outW),
 			int32(outH),
 			commands,
 			buttonActions,
 			coordinator,
+			&selectedModeIndex,
 		)
 		if errors.Is(err, errQuitRequested) {
 			return
@@ -723,6 +810,7 @@ func main() {
 		}
 
 		fmt.Printf("t0: %s\n", t0.UTC().Format(time.RFC3339Nano))
+		mode := sprintModes[selectedModeIndex]
 		finalT0, err := recordWithStopwatch(
 			renderer,
 			font,
@@ -730,6 +818,7 @@ func main() {
 			int32(outH),
 			t0,
 			coordinator,
+			mode,
 		)
 		t0 = finalT0
 		if err != nil {
