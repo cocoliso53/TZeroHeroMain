@@ -23,10 +23,24 @@ type FrameMetadata struct {
 	FrameWallClock int64 `json:"FrameWallClock"`
 }
 
-func record() error {
+type sprintMode struct {
+	name              string
+	captureStartDelay time.Duration
+	recordingDuration time.Duration
+}
+
+var sprintModes = []sprintMode{
+	{name: "Short / Accel", captureStartDelay: 2 * time.Second, recordingDuration: 4 * time.Second},
+	{name: "60 m", captureStartDelay: 6 * time.Second, recordingDuration: 4 * time.Second},
+	{name: "100 m", captureStartDelay: 9 * time.Second, recordingDuration: 7 * time.Second},
+	{name: "150 m", captureStartDelay: 14 * time.Second, recordingDuration: 10 * time.Second},
+	{name: "200 m", captureStartDelay: 19 * time.Second, recordingDuration: 13 * time.Second},
+}
+
+func record(duration time.Duration) error {
 	cmd := exec.Command(
 		"rpicam-vid",
-		"-t", "5000",
+		"-t", strconv.FormatInt(duration.Milliseconds(), 10),
 		"--width", "1280",
 		"--height", "720",
 		"--framerate", "100",
@@ -101,6 +115,57 @@ func drawFinishLine(
 	return nil
 }
 
+func changeSprintMode(index *int, delta int) {
+	*index = (*index + delta + len(sprintModes)) % len(sprintModes)
+	mode := sprintModes[*index]
+	windowEnd := mode.captureStartDelay + mode.recordingDuration
+	fmt.Printf("Mode: %s (%.0f-%.0f seconds)\n", mode.name,
+		mode.captureStartDelay.Seconds(), windowEnd.Seconds())
+}
+
+func drawSprintMode(
+	renderer *sdl.Renderer,
+	font *ttf.Font,
+	outW int32,
+	mode sprintMode,
+) error {
+	windowEnd := mode.captureStartDelay + mode.recordingDuration
+	label := fmt.Sprintf("%s   %.0f-%.0f s", mode.name,
+		mode.captureStartDelay.Seconds(), windowEnd.Seconds())
+	surface, err := font.RenderUTF8Blended(label,
+		sdl.Color{R: 255, G: 255, B: 255, A: 255})
+	if err != nil {
+		return err
+	}
+	defer surface.Free()
+
+	texture, err := renderer.CreateTextureFromSurface(surface)
+	if err != nil {
+		return err
+	}
+	defer texture.Destroy()
+
+	textRect := sdl.Rect{
+		X: (outW - surface.W) / 2,
+		Y: 20,
+		W: surface.W,
+		H: surface.H,
+	}
+	background := sdl.Rect{
+		X: textRect.X - 12,
+		Y: textRect.Y - 8,
+		W: textRect.W + 24,
+		H: textRect.H + 16,
+	}
+	if err := renderer.SetDrawColor(0, 0, 0, 255); err != nil {
+		return err
+	}
+	if err := renderer.FillRect(&background); err != nil {
+		return err
+	}
+	return renderer.Copy(texture, nil, &textRect)
+}
+
 func readJPEG(reader *bufio.Reader) ([]byte, error) {
 	var frame []byte
 
@@ -173,14 +238,17 @@ var errQuitRequested = errors.New("quit requested")
 
 func waitForT0WithPreview(
 	renderer *sdl.Renderer,
+	font *ttf.Font,
 	outW int32,
 	outH int32,
 	commands <-chan string,
 	buttonActions <-chan buttonAction,
 	coordinator *gunCoordinator,
+	modeIndex *int,
 ) (time.Time, error) {
 	fmt.Println("Live calibration mode; waiting for gun T0")
-	fmt.Print("[q]uit > ")
+	changeSprintMode(modeIndex, 0)
+	fmt.Print("[s]tart [n]ext mode [p]revious mode [q]uit > ")
 
 	cmd := exec.Command(
 		"rpicam-vid",
@@ -205,7 +273,19 @@ func waitForT0WithPreview(
 	}
 
 	coordinator.setAccepting(true)
-	defer coordinator.setAccepting(false)
+	t0Accepted := false
+	defer func() {
+		if !t0Accepted {
+			coordinator.setAccepting(false)
+		}
+	}()
+	requestGunT0 := func() {
+		if err := coordinator.requestT0(); err != nil {
+			fmt.Printf("Cannot request T0: %v\n", err)
+			return
+		}
+		fmt.Println("T0 requested from gun")
+	}
 
 	frames := make(chan []byte, 1)
 
@@ -258,7 +338,9 @@ func waitForT0WithPreview(
 	for {
 		select {
 		case t0 := <-coordinator.t0s:
-			fmt.Printf("T0 accepted: %s\n", t0.UTC().Format(time.RFC3339Nano))
+			t0Accepted = true
+			fmt.Printf("T0 accepted for %s: %s\n", sprintModes[*modeIndex].name,
+				t0.UTC().Format(time.RFC3339Nano))
 			stopCamera()
 			if texture != nil {
 				texture.Destroy()
@@ -276,15 +358,29 @@ func waitForT0WithPreview(
 			}
 
 			switch command {
+			case "s":
+				requestGunT0()
+			case "n":
+				changeSprintMode(modeIndex, 1)
+			case "p":
+				changeSprintMode(modeIndex, -1)
 			case "q":
 				stopCamera()
 				return time.Time{}, errQuitRequested
 
 			default:
-				fmt.Print("[q]uit > ")
+				fmt.Print("[s]tart [n]ext mode [p]revious mode [q]uit > ")
 			}
 
-		case <-buttonActions:
+		case action := <-buttonActions:
+			switch action {
+			case buttonConfirm:
+				requestGunT0()
+			case buttonPrevious:
+				changeSprintMode(modeIndex, -1)
+			case buttonNext:
+				changeSprintMode(modeIndex, 1)
+			}
 
 		default:
 		}
@@ -335,6 +431,9 @@ func waitForT0WithPreview(
 		}
 
 		if err := drawFinishLine(renderer, outW, outH); err != nil {
+			return time.Time{}, err
+		}
+		if err := drawSprintMode(renderer, font, outW, sprintModes[*modeIndex]); err != nil {
 			return time.Time{}, err
 		}
 
@@ -431,11 +530,13 @@ func displayStopwatch(
 	outH int32,
 	elapsed time.Duration,
 ) error {
+	var label string
 	if elapsed < 0 {
-		return displayBlack(renderer)
+		label = fmt.Sprintf("START IN %.1f", (-elapsed).Seconds())
+	} else {
+		label = fmt.Sprintf("%.3f", elapsed.Seconds())
 	}
 
-	label := fmt.Sprintf("%.3f", elapsed.Seconds())
 	surface, err := font.RenderUTF8Blended(label, sdl.Color{R: 255, G: 255, B: 255, A: 255})
 	if err != nil {
 		return err
@@ -474,42 +575,125 @@ func recordWithStopwatch(
 	outW int32,
 	outH int32,
 	t0 time.Time,
-) error {
-	captureStart := t0.Add(5 * time.Second)
-	fmt.Printf("Capture starts: %s\n", captureStart.UTC().Format(time.RFC3339Nano))
+	coordinator *gunCoordinator,
+	mode sprintMode,
+) (time.Time, error) {
+	defer coordinator.setAccepting(false)
+
+	captureStart := t0.Add(mode.captureStartDelay)
+	fmt.Printf("%s capture starts: %s (duration %.0f s)\n", mode.name,
+		captureStart.UTC().Format(time.RFC3339Nano), mode.recordingDuration.Seconds())
 
 	recordingDone := make(chan error, 1)
-	go func() {
-		if wait := time.Until(captureStart); wait > 0 {
-			time.Sleep(wait)
-		}
-		recordingDone <- record()
-	}()
+	captureTimer := time.NewTimer(max(time.Until(captureStart), 0))
+	defer captureTimer.Stop()
+	recordingStarted := false
 
 	ticker := time.NewTicker(16 * time.Millisecond)
 	defer ticker.Stop()
 	t0Logged := false
+	applyReplacement := func(replacementT0 time.Time) {
+		t0 = replacementT0
+		captureStart = t0.Add(mode.captureStartDelay)
+		t0Logged = false
+		if !captureTimer.Stop() {
+			select {
+			case <-captureTimer.C:
+			default:
+			}
+		}
+		captureTimer.Reset(max(time.Until(captureStart), 0))
+		fmt.Printf("T0 replaced: %s\n", t0.UTC().Format(time.RFC3339Nano))
+		fmt.Printf("Capture rescheduled: %s\n", captureStart.UTC().Format(time.RFC3339Nano))
+	}
 
 	for {
+		select {
+		case replacementT0 := <-coordinator.t0s:
+			applyReplacement(replacementT0)
+			continue
+		default:
+		}
+
 		now := time.Now()
 		if !t0Logged && !now.Before(t0) {
-			t0Logged = true
-			fmt.Printf("T0 reached: %s\n", now.UTC().Format(time.RFC3339Nano))
+			if coordinator.closeReplacementWindow(t0) {
+				t0Logged = true
+				fmt.Printf("T0 reached: %s\n", now.UTC().Format(time.RFC3339Nano))
+			}
 		}
 		if err := displayStopwatch(renderer, font, outW, outH, now.Sub(t0)); err != nil {
-			return err
+			return t0, err
 		}
 
 		for event := sdl.PollEvent(); event != nil; event = sdl.PollEvent() {
 			if _, ok := event.(*sdl.QuitEvent); ok {
-				return errQuitRequested
+				return t0, errQuitRequested
 			}
 		}
 
 		select {
+		case replacementT0 := <-coordinator.t0s:
+			applyReplacement(replacementT0)
+
+		case <-captureTimer.C:
+			if !recordingStarted {
+				recordingStarted = true
+				go func() {
+					recordingDone <- record(mode.recordingDuration)
+				}()
+			}
+
 		case err := <-recordingDone:
-			return err
+			return t0, err
 		case <-ticker.C:
+		}
+	}
+}
+
+func frameStepForClicks(clicks int) int {
+	switch clicks {
+	case 1:
+		return 1
+	case 2:
+		return 10
+	case 3:
+		return 50
+	default:
+		return 100
+	}
+}
+
+func collectNavigationClicks(
+	direction buttonAction,
+	buttonActions <-chan buttonAction,
+) (buttonAction, int) {
+	clicks := 1
+	timer := time.NewTimer(400 * time.Millisecond)
+	defer timer.Stop()
+
+	for {
+		select {
+		case action := <-buttonActions:
+			if action == buttonConfirm {
+				return action, 1
+			}
+			if action != direction {
+				direction = action
+				clicks = 1
+			} else {
+				clicks++
+			}
+			if !timer.Stop() {
+				select {
+				case <-timer.C:
+				default:
+				}
+			}
+			timer.Reset(400 * time.Millisecond)
+
+		case <-timer.C:
+			return direction, clicks
 		}
 	}
 }
@@ -562,6 +746,7 @@ func reviewFrames(
 		fmt.Print("[n]ext [p]revious [number] [q]uit; GPIO17 new sprint > ")
 
 		var input string
+		frameDelta := 0
 		select {
 		case command, ok := <-commands:
 			if !ok {
@@ -575,12 +760,37 @@ func reviewFrames(
 			case buttonConfirm:
 				return true
 			case buttonPrevious:
-				input = "p"
+				direction, clicks := collectNavigationClicks(action, buttonActions)
+				if direction == buttonConfirm {
+					return true
+				}
+				step := frameStepForClicks(clicks)
+				fmt.Printf("%d clicks: %d frames\n", clicks, step)
+				if direction == buttonPrevious {
+					frameDelta = -step
+				} else {
+					frameDelta = step
+				}
 			case buttonNext:
-				input = "n"
+				direction, clicks := collectNavigationClicks(action, buttonActions)
+				if direction == buttonConfirm {
+					return true
+				}
+				step := frameStepForClicks(clicks)
+				fmt.Printf("%d clicks: %d frames\n", clicks, step)
+				if direction == buttonPrevious {
+					frameDelta = -step
+				} else {
+					frameDelta = step
+				}
 			default:
 				continue
 			}
+		}
+
+		if frameDelta != 0 {
+			index = max(0, min(len(frames)-1, index+frameDelta))
+			continue
 		}
 
 		switch input {
@@ -662,15 +872,18 @@ func main() {
 		log.Fatal(err)
 	}
 
+	selectedModeIndex := 2
 	for {
 		drainButtonActions(buttonActions)
 		t0, err := waitForT0WithPreview(
 			renderer,
+			font,
 			int32(outW),
 			int32(outH),
 			commands,
 			buttonActions,
 			coordinator,
+			&selectedModeIndex,
 		)
 		if errors.Is(err, errQuitRequested) {
 			return
@@ -681,13 +894,18 @@ func main() {
 		}
 
 		fmt.Printf("t0: %s\n", t0.UTC().Format(time.RFC3339Nano))
-		if err := recordWithStopwatch(
+		mode := sprintModes[selectedModeIndex]
+		finalT0, err := recordWithStopwatch(
 			renderer,
 			font,
 			int32(outW),
 			int32(outH),
 			t0,
-		); err != nil {
+			coordinator,
+			mode,
+		)
+		t0 = finalT0
+		if err != nil {
 			if !errors.Is(err, errQuitRequested) {
 				log.Printf("recording failed: %v", err)
 			}
