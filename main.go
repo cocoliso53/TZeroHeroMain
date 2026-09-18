@@ -867,7 +867,7 @@ func main() {
 		fmt.Println("Physical buttons ready: GPIO17 new sprint, GPIO27 previous, GPIO22 next")
 	}
 
-	coordinator, err := startGunCoordinator()
+	coordinator, err := startGunCoordinator(buttons)
 	if err != nil {
 		log.Fatal(err)
 	}

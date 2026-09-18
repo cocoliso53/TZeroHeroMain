@@ -33,6 +33,7 @@ type gunCoordinator struct {
 	activeT0        int64
 	connectionMutex sync.Mutex
 	connection      net.Conn
+	statusLED       *piButtons
 }
 
 func (coordinator *gunCoordinator) setAccepting(accepting bool) {
@@ -194,13 +195,16 @@ func respondToHeartbeat(connection net.Conn, message string) error {
 	return err
 }
 
-func startGunCoordinator() (*gunCoordinator, error) {
+func startGunCoordinator(statusLED *piButtons) (*gunCoordinator, error) {
 	listener, err := net.Listen("tcp", fmt.Sprintf(":%d", gunTCPPort))
 	if err != nil {
 		return nil, err
 	}
 
-	coordinator := &gunCoordinator{t0s: make(chan time.Time, 4)}
+	coordinator := &gunCoordinator{
+		t0s:       make(chan time.Time, 4),
+		statusLED: statusLED,
+	}
 	go coordinator.serve(listener)
 	return coordinator, nil
 }
@@ -208,6 +212,7 @@ func startGunCoordinator() (*gunCoordinator, error) {
 func (coordinator *gunCoordinator) serve(listener net.Listener) {
 	defer listener.Close()
 	for {
+		coordinator.statusLED.setSyncSearching()
 		log.Printf("Waiting for gun on TCP port %d", gunTCPPort)
 		connection, err := listener.Accept()
 		if err != nil {
@@ -295,6 +300,7 @@ func (coordinator *gunCoordinator) handleSession(connection net.Conn) error {
 			continue
 		}
 		if message == "CLOCK_SYNCED" {
+			coordinator.statusLED.showSyncSuccess()
 			break
 		}
 	}

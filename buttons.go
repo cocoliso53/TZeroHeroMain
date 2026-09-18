@@ -12,7 +12,15 @@ const (
 	newSprintButtonGPIO = 17
 	previousButtonGPIO  = 27
 	nextButtonGPIO      = 22
+	syncStatusLEDGPIO   = 23
 	buttonDebounce      = 30 * time.Millisecond
+)
+
+type syncLEDCommand uint8
+
+const (
+	syncLEDSearching syncLEDCommand = iota
+	syncLEDSuccess
 )
 
 type buttonAction uint8
@@ -24,10 +32,11 @@ const (
 )
 
 type piButtons struct {
-	actions chan buttonAction
-	stop    chan struct{}
-	done    chan struct{}
-	once    sync.Once
+	actions     chan buttonAction
+	ledCommands chan syncLEDCommand
+	stop        chan struct{}
+	waitGroup   sync.WaitGroup
+	once        sync.Once
 }
 
 type debouncedPin struct {
@@ -55,19 +64,25 @@ func startPiButtons() (*piButtons, error) {
 		pins[index].stable = pins[index].lastRead
 		pins[index].changedAt = time.Now()
 	}
+	statusLED := rpio.Pin(syncStatusLEDGPIO)
+	statusLED.Output()
+	statusLED.Low()
 
 	buttons := &piButtons{
-		actions: make(chan buttonAction, 8),
-		stop:    make(chan struct{}),
-		done:    make(chan struct{}),
+		actions:     make(chan buttonAction, 8),
+		ledCommands: make(chan syncLEDCommand, 4),
+		stop:        make(chan struct{}),
 	}
 
+	buttons.waitGroup.Add(2)
 	go buttons.poll(pins)
+	go buttons.runStatusLED(statusLED)
+	buttons.setSyncSearching()
 	return buttons, nil
 }
 
 func (buttons *piButtons) poll(pins []debouncedPin) {
-	defer close(buttons.done)
+	defer buttons.waitGroup.Done()
 	ticker := time.NewTicker(5 * time.Millisecond)
 	defer ticker.Stop()
 
@@ -101,10 +116,90 @@ func (buttons *piButtons) poll(pins []debouncedPin) {
 	}
 }
 
+func (buttons *piButtons) runStatusLED(pin rpio.Pin) {
+	defer buttons.waitGroup.Done()
+	defer pin.Low()
+
+	ticker := time.NewTicker(10 * time.Millisecond)
+	defer ticker.Stop()
+
+	mode := syncLEDSearching
+	ledOn := false
+	nextChange := time.Now()
+	successTransitionsRemaining := 0
+
+	setLED := func(on bool) {
+		ledOn = on
+		if on {
+			pin.High()
+		} else {
+			pin.Low()
+		}
+	}
+
+	for {
+		select {
+		case command := <-buttons.ledCommands:
+			mode = command
+			setLED(true)
+			if command == syncLEDSuccess {
+				successTransitionsRemaining = 5
+				nextChange = time.Now().Add(120 * time.Millisecond)
+			} else {
+				nextChange = time.Now().Add(150 * time.Millisecond)
+			}
+
+		case now := <-ticker.C:
+			if now.Before(nextChange) {
+				continue
+			}
+
+			switch mode {
+			case syncLEDSearching:
+				setLED(!ledOn)
+				if ledOn {
+					nextChange = now.Add(150 * time.Millisecond)
+				} else {
+					nextChange = now.Add(1850 * time.Millisecond)
+				}
+
+			case syncLEDSuccess:
+				if successTransitionsRemaining == 0 {
+					continue
+				}
+				setLED(!ledOn)
+				successTransitionsRemaining--
+				nextChange = now.Add(120 * time.Millisecond)
+			}
+
+		case <-buttons.stop:
+			return
+		}
+	}
+}
+
+func (buttons *piButtons) setLEDCommand(command syncLEDCommand) {
+	if buttons == nil {
+		return
+	}
+	select {
+	case buttons.ledCommands <- command:
+	case <-buttons.stop:
+	}
+}
+
+func (buttons *piButtons) setSyncSearching() {
+	buttons.setLEDCommand(syncLEDSearching)
+}
+
+func (buttons *piButtons) showSyncSuccess() {
+	buttons.setLEDCommand(syncLEDSuccess)
+}
+
 func (buttons *piButtons) Close() {
 	buttons.once.Do(func() {
 		close(buttons.stop)
-		<-buttons.done
+		buttons.waitGroup.Wait()
 		rpio.Close()
 	})
 }
