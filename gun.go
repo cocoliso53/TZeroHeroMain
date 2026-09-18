@@ -350,6 +350,7 @@ func (coordinator *gunCoordinator) handleSession(connection net.Conn) error {
 			if _, err := fmt.Fprintf(connection, "ACK_T0 %d\n", t0Nanoseconds); err != nil {
 				return err
 			}
+			coordinator.statusLED.showSyncSuccess()
 
 			log.Printf("T0 acknowledged: %s", t0.UTC().Format(time.RFC3339Nano))
 			coordinator.t0s <- t0
